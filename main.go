@@ -48,6 +48,18 @@ type PathStat struct {
 	RequestTime   float64
 }
 
+type UpstreamStat struct {
+	Upstream      string
+	Host          string // 关联的主机
+	Request       int64
+	Request20X    int64
+	Request4XX    int64
+	Request5XX    int64
+	RequestLength int64
+	RequestTime   float64
+	mu            sync.RWMutex
+}
+
 type StatResult struct {
 	Host           string              `json:"host,omitempty"`
 	Path           string              `json:"path,omitempty"`
@@ -63,11 +75,27 @@ type StatResult struct {
 	Paths          map[string]PathStat `json:"paths,omitempty"`
 }
 
+type UpstreamStatResult struct {
+	Upstream       string  `json:"upstream"`
+	Host           string  `json:"host"`
+	Request        int64   `json:"request"`
+	Request20X     int64   `json:"request_20X"`
+	Request4XX     int64   `json:"request_4XX"`
+	Request5XX     int64   `json:"request_5XX"`
+	RequestLength  int64   `json:"request_length"`
+	RequestTime    float64 `json:"request_time"`
+	AvgRequestTime float64 `json:"avg_request_time"`
+	AvgRequestSize float64 `json:"avg_request_size"`
+	SuccessRate    float64 `json:"success_rate"`
+}
+
 var (
 	cfg            Config
 	client         sls.ClientInterface
 	hostStats      = make(map[string]*HostStat)
+	upstreamStats  = make(map[string]*UpstreamStat)
 	mu             sync.RWMutex
+	upstreamMu     sync.RWMutex
 	ctx            context.Context
 	cancel         context.CancelFunc
 	totalProcessed int64
@@ -311,6 +339,11 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 			reqTime, _ := strconv.ParseFloat(fields["request_time"], 64)
 			uri := fields["request_uri"]
 
+			// 获取 upstream 相关字段
+			upstreamAddr := fields["upstream_addr"]
+			upstreamStatus, _ := strconv.Atoi(fields["upstream_status"])
+			upstreamRespTime, _ := strconv.ParseFloat(fields["upstream_response_time"], 64)
+
 			// 第一次处理日志时打印样例
 			if atomic.LoadInt64(&totalProcessed) == 0 && processed == 0 {
 				log.Println("Sample log entry:")
@@ -319,6 +352,9 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 				log.Printf("  request_uri: %s", uri)
 				log.Printf("  request_length: %d", reqLen)
 				log.Printf("  request_time: %.3f", reqTime)
+				log.Printf("  upstream_addr: %s", upstreamAddr)
+				log.Printf("  upstream_status: %d", upstreamStatus)
+				log.Printf("  upstream_response_time: %.3f", upstreamRespTime)
 			}
 
 			// 更新主机统计
@@ -373,6 +409,29 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 			}
 
 			h.mu.Unlock()
+
+			// 更新 upstream 统计
+			if upstreamAddr != "" {
+				us := getOrCreateUpstream(upstreamAddr, host)
+				us.mu.Lock()
+
+				us.Request++
+				us.RequestLength += reqLen
+				us.RequestTime += upstreamRespTime // 使用 upstream_response_time
+
+				// 使用 upstream_status 进行分类
+				switch {
+				case upstreamStatus >= 200 && upstreamStatus < 300:
+					us.Request20X++
+				case upstreamStatus >= 400 && upstreamStatus < 500:
+					us.Request4XX++
+				case upstreamStatus >= 500 && upstreamStatus < 600:
+					us.Request5XX++
+				}
+
+				us.mu.Unlock()
+			}
+
 			processed++
 		}
 	}
@@ -420,6 +479,32 @@ func getOrCreatePath(h *HostStat, prefix string) *PathStat {
 	return ps
 }
 
+func getOrCreateUpstream(upstream string, host string) *UpstreamStat {
+	upstreamMu.RLock()
+	us, ok := upstreamStats[upstream]
+	upstreamMu.RUnlock()
+
+	if ok {
+		return us
+	}
+
+	upstreamMu.Lock()
+	defer upstreamMu.Unlock()
+
+	// 双重检查
+	if us, ok := upstreamStats[upstream]; ok {
+		return us
+	}
+
+	us = &UpstreamStat{
+		Upstream: upstream,
+		Host:     host,
+	}
+	upstreamStats[upstream] = us
+	log.Printf("New upstream tracked: %s (host: %s)", upstream, host)
+	return us
+}
+
 func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat) StatResult {
 	result := StatResult{
 		Host:          host,
@@ -447,11 +532,34 @@ func calculateStatResult(host string, request, request20X, request4XX, request5X
 	return result
 }
 
+func calculateUpstreamStatResult(us *UpstreamStat) UpstreamStatResult {
+	result := UpstreamStatResult{
+		Upstream:      us.Upstream,
+		Host:          us.Host,
+		Request:       us.Request,
+		Request20X:    us.Request20X,
+		Request4XX:    us.Request4XX,
+		Request5XX:    us.Request5XX,
+		RequestLength: us.RequestLength,
+		RequestTime:   us.RequestTime,
+	}
+
+	if us.Request > 0 {
+		result.AvgRequestTime = us.RequestTime / float64(us.Request)
+		result.AvgRequestSize = float64(us.RequestLength) / float64(us.Request)
+		result.SuccessRate = float64(us.Request20X) / float64(us.Request) * 100
+	}
+
+	return result
+}
+
 func startHTTP() {
 	r := mux.NewRouter()
 	r.HandleFunc("/hosts", getHosts).Methods("GET")
 	r.HandleFunc("/hosts/{host}", getHostDetail).Methods("GET")
 	r.HandleFunc("/hosts/{host}/paths/{path:.*}", getHostPath).Methods("GET")
+	r.HandleFunc("/upstreams", getUpstreams).Methods("GET")
+	r.HandleFunc("/upstreams/{upstream}", getUpstreamDetail).Methods("GET")
 	r.HandleFunc("/stats", getGlobalStats).Methods("GET")
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 
@@ -465,6 +573,15 @@ func startHTTP() {
 	}
 
 	log.Printf("HTTP server listening on %s", cfg.HTTPListen)
+	log.Println("Available endpoints:")
+	log.Println("  GET /health")
+	log.Println("  GET /stats")
+	log.Println("  GET /hosts")
+	log.Println("  GET /hosts/{host}")
+	log.Println("  GET /hosts/{host}/paths/{path}")
+	log.Println("  GET /upstreams")
+	log.Println("  GET /upstreams/{upstream}")
+
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("HTTP server error:", err)
 	}
@@ -484,9 +601,14 @@ func getGlobalStats(w http.ResponseWriter, _ *http.Request) {
 	hostCount := len(hostStats)
 	mu.RUnlock()
 
+	upstreamMu.RLock()
+	upstreamCount := len(upstreamStats)
+	upstreamMu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_hosts":     hostCount,
+		"total_upstreams": upstreamCount,
 		"total_processed": atomic.LoadInt64(&totalProcessed),
 		"uptime_seconds":  time.Since(startTime).Seconds(),
 		"qps":             float64(atomic.LoadInt64(&totalProcessed)) / time.Since(startTime).Seconds(),
@@ -580,6 +702,47 @@ func getHostPath(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func getUpstreams(w http.ResponseWriter, _ *http.Request) {
+	upstreamMu.RLock()
+	upstreams := make([]*UpstreamStat, 0, len(upstreamStats))
+	for _, us := range upstreamStats {
+		upstreams = append(upstreams, us)
+	}
+	upstreamMu.RUnlock()
+
+	results := make([]UpstreamStatResult, 0, len(upstreams))
+	for _, us := range upstreams {
+		us.mu.RLock()
+		result := calculateUpstreamStatResult(us)
+		us.mu.RUnlock()
+		results = append(results, result)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func getUpstreamDetail(w http.ResponseWriter, r *http.Request) {
+	v := mux.Vars(r)
+	upstream := v["upstream"]
+
+	upstreamMu.RLock()
+	us, ok := upstreamStats[upstream]
+	upstreamMu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Upstream not found", http.StatusNotFound)
+		return
+	}
+
+	us.mu.RLock()
+	result := calculateUpstreamStatResult(us)
+	us.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
