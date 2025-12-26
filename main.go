@@ -34,7 +34,9 @@ type HostStat struct {
 	Request5XX    int64
 	RequestLength int64
 	RequestTime   float64
-	Paths         map[string]*PathStat
+	Paths         map[string]*PathStat // 完整 URI 路径统计
+	PathsLRU      []string             // 最近更新的完整路径列表，最多保留30个
+	Prefixes      map[string]*PathStat // path_prefix 前缀统计（独立维度）
 	mu            sync.RWMutex
 }
 
@@ -46,6 +48,7 @@ type PathStat struct {
 	Request5XX    int64
 	RequestLength int64
 	RequestTime   float64
+	LastUpdated   time.Time // 最后更新时间
 }
 
 type UpstreamStat struct {
@@ -72,7 +75,13 @@ type StatResult struct {
 	AvgRequestTime float64             `json:"avg_request_time"`
 	AvgRequestSize float64             `json:"avg_request_size"`
 	SuccessRate    float64             `json:"success_rate"`
-	Paths          map[string]PathStat `json:"paths,omitempty"`
+	Paths          map[string]PathStat `json:"paths,omitempty"`    // 完整路径统计
+	Prefixes       map[string]PathStat `json:"prefixes,omitempty"` // 前缀统计
+}
+
+type PathListItem struct {
+	Path    string `json:"path"`
+	Request int64  `json:"request"`
 }
 
 type UpstreamStatResult struct {
@@ -339,6 +348,11 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 			reqTime, _ := strconv.ParseFloat(fields["request_time"], 64)
 			uri := fields["request_uri"]
 
+			// 去除 query 参数，只保留路径
+			trimPath := uri
+			if idx := strings.Index(uri, "?"); idx != -1 {
+				trimPath = uri[:idx]
+			}
 			// 获取 upstream 相关字段
 			upstreamAddr := fields["upstream_addr"]
 			upstreamStatus, _ := strconv.Atoi(fields["upstream_status"])
@@ -375,35 +389,46 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 				h.Request5XX++
 			}
 
-			// 更新路径统计
-			if prefixes, ok := cfg.PathPrefix[host]; ok {
-				matched := false
+			// 1. 统计完整 URI 路径（所有请求都统计）
+			uriPath := getOrCreatePath(h, trimPath)
+			uriPath.Request++
+			uriPath.RequestLength += reqLen
+			uriPath.RequestTime += reqTime
+			uriPath.LastUpdated = time.Now()
+
+			switch {
+			case status >= 200 && status < 300:
+				uriPath.Request20X++
+			case status >= 400 && status < 500:
+				uriPath.Request4XX++
+			case status >= 500 && status < 600:
+				uriPath.Request5XX++
+			}
+
+			// 2. 如果配置了 path_prefix，独立统计匹配的前缀
+			if prefixes, ok := cfg.PathPrefix[host]; ok && len(prefixes) > 0 {
 				for _, prefix := range prefixes {
-					if strings.HasPrefix(uri, prefix) {
-						ps := getOrCreatePath(h, prefix)
-						ps.Request++
-						ps.RequestLength += reqLen
-						ps.RequestTime += reqTime
+					if strings.HasPrefix(trimPath, prefix) {
+						prefixStat := getOrCreatePrefix(h, prefix)
+						prefixStat.Request++
+						prefixStat.RequestLength += reqLen
+						prefixStat.RequestTime += reqTime
+						prefixStat.LastUpdated = time.Now()
 
 						switch {
 						case status >= 200 && status < 300:
-							ps.Request20X++
+							prefixStat.Request20X++
 						case status >= 400 && status < 500:
-							ps.Request4XX++
+							prefixStat.Request4XX++
 						case status >= 500 && status < 600:
-							ps.Request5XX++
+							prefixStat.Request5XX++
 						}
-						matched = true
-						break // 只匹配第一个前缀
-					}
-				}
 
-				// 第一次匹配/不匹配时打印调试信息
-				if processed < 5 {
-					if matched {
-						log.Printf("  [%s] URI '%s' matched path prefix", host, uri)
-					} else {
-						log.Printf("  [%s] URI '%s' did not match any configured prefix: %v", host, uri, prefixes)
+						// 第一次匹配时打印调试信息
+						if processed < 5 {
+							log.Printf("  [%s] URI '%s' matched prefix: %s", host, uri, prefix)
+						}
+						break // 只匹配第一个前缀
 					}
 				}
 			}
@@ -462,8 +487,10 @@ func getOrCreateHost(host string) *HostStat {
 	}
 
 	h = &HostStat{
-		Host:  host,
-		Paths: make(map[string]*PathStat),
+		Host:     host,
+		Paths:    make(map[string]*PathStat),
+		PathsLRU: make([]string, 0, 30),
+		Prefixes: make(map[string]*PathStat),
 	}
 	hostStats[host] = h
 	log.Printf("New host tracked: %s", host)
@@ -472,11 +499,53 @@ func getOrCreateHost(host string) *HostStat {
 
 func getOrCreatePath(h *HostStat, prefix string) *PathStat {
 	if ps, ok := h.Paths[prefix]; ok {
+		// 更新 LRU 列表
+		updatePathLRU(h, prefix)
 		return ps
 	}
-	ps := &PathStat{Path: prefix}
+	ps := &PathStat{
+		Path:        prefix,
+		LastUpdated: time.Now(),
+	}
 	h.Paths[prefix] = ps
+
+	// 添加到 LRU 列表头部
+	updatePathLRU(h, prefix)
+
+	// 如果超过30个，删除最旧的
+	if len(h.PathsLRU) > 30 {
+		oldestPath := h.PathsLRU[len(h.PathsLRU)-1]
+		delete(h.Paths, oldestPath)
+		h.PathsLRU = h.PathsLRU[:30]
+	}
+
 	return ps
+}
+
+func getOrCreatePrefix(h *HostStat, prefix string) *PathStat {
+	if ps, ok := h.Prefixes[prefix]; ok {
+		return ps
+	}
+	ps := &PathStat{
+		Path:        prefix,
+		LastUpdated: time.Now(),
+	}
+	h.Prefixes[prefix] = ps
+	return ps
+}
+
+// updatePathLRU 更新路径的 LRU 位置（移到最前面）
+func updatePathLRU(h *HostStat, path string) {
+	// 先从列表中移除这个路径（如果存在）
+	for i, p := range h.PathsLRU {
+		if p == path {
+			h.PathsLRU = append(h.PathsLRU[:i], h.PathsLRU[i+1:]...)
+			break
+		}
+	}
+
+	// 添加到列表头部
+	h.PathsLRU = append([]string{path}, h.PathsLRU...)
 }
 
 func getOrCreateUpstream(upstream string, host string) *UpstreamStat {
@@ -505,7 +574,7 @@ func getOrCreateUpstream(upstream string, host string) *UpstreamStat {
 	return us
 }
 
-func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat) StatResult {
+func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat, prefixes map[string]*PathStat) StatResult {
 	result := StatResult{
 		Host:          host,
 		Request:       request,
@@ -522,10 +591,17 @@ func calculateStatResult(host string, request, request20X, request4XX, request5X
 		result.SuccessRate = float64(request20X) / float64(request) * 100
 	}
 
-	if paths != nil {
-		result.Paths = make(map[string]PathStat)
-		for k, v := range paths {
-			result.Paths[k] = *v
+	// if paths != nil {
+	// 	result.Paths = make(map[string]PathStat)
+	// 	for k, v := range paths {
+	// 		result.Paths[k] = *v
+	// 	}
+	// }
+
+	if prefixes != nil {
+		result.Prefixes = make(map[string]PathStat)
+		for k, v := range prefixes {
+			result.Prefixes[k] = *v
 		}
 	}
 
@@ -557,6 +633,7 @@ func startHTTP() {
 	r := mux.NewRouter()
 	r.HandleFunc("/hosts", getHosts).Methods("GET")
 	r.HandleFunc("/hosts/{host}", getHostDetail).Methods("GET")
+	r.HandleFunc("/hosts/{host}/paths", getHostPaths).Methods("GET")
 	r.HandleFunc("/hosts/{host}/paths/{path:.*}", getHostPath).Methods("GET")
 	r.HandleFunc("/upstreams", getUpstreams).Methods("GET")
 	r.HandleFunc("/upstreams/{upstream}", getUpstreamDetail).Methods("GET")
@@ -578,6 +655,7 @@ func startHTTP() {
 	log.Println("  GET /stats")
 	log.Println("  GET /hosts")
 	log.Println("  GET /hosts/{host}")
+	log.Println("  GET /hosts/{host}/paths")
 	log.Println("  GET /hosts/{host}/paths/{path}")
 	log.Println("  GET /upstreams")
 	log.Println("  GET /upstreams/{upstream}")
@@ -628,7 +706,7 @@ func getHosts(w http.ResponseWriter, _ *http.Request) {
 		h.mu.RLock()
 		result := calculateStatResult(
 			h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
-			h.RequestLength, h.RequestTime, nil,
+			h.RequestLength, h.RequestTime, nil, nil,
 		)
 		h.mu.RUnlock()
 		results = append(results, result)
@@ -654,7 +732,7 @@ func getHostDetail(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	result := calculateStatResult(
 		h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
-		h.RequestLength, h.RequestTime, h.Paths,
+		h.RequestLength, h.RequestTime, h.Paths, h.Prefixes,
 	)
 	h.mu.RUnlock()
 
@@ -705,6 +783,36 @@ func getHostPath(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+func getHostPaths(w http.ResponseWriter, r *http.Request) {
+	v := mux.Vars(r)
+	host := v["host"]
+
+	mu.RLock()
+	h, ok := hostStats[host]
+	mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Host not found", http.StatusNotFound)
+		return
+	}
+
+	h.mu.RLock()
+	// 根据 LRU 列表返回路径信息（已经按最近更新排序）
+	results := make([]PathListItem, 0, len(h.PathsLRU))
+	for _, path := range h.PathsLRU {
+		if ps, ok := h.Paths[path]; ok {
+			results = append(results, PathListItem{
+				Path:    ps.Path,
+				Request: ps.Request,
+			})
+		}
+	}
+	h.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
 }
 
 func getUpstreams(w http.ResponseWriter, _ *http.Request) {
