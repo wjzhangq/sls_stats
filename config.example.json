@@ -1,0 +1,18 @@
+{
+  "endpoint": "cn-beijing.log.aliyuncs.com",
+  "access_key": "LT***********29",
+  "access_secret": "Ex*********fM",
+  "project": "log-all-slb",
+  "logstore": "log-all-logstore",
+  "consumer_group": "realtime-stat",
+  "consumer_name": "stat-instance-1",
+
+  "path_prefix": {
+    "test.com": [
+      "/api/anyone",
+      "/api/order"
+    ]
+  },
+
+  "http_listen": ":8080"
+}
