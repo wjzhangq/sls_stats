@@ -95,11 +95,9 @@ func main() {
 	}
 
 	log.Println("Creating SLS client...")
-	client = sls.CreateNormalInterface(
+	client = sls.CreateNormalInterfaceV2(
 		cfg.Endpoint,
-		cfg.AccessKey,
-		cfg.AccessSecret,
-		cfg.Project,
+		sls.NewStaticCredentialsProvider(cfg.AccessKey, cfg.AccessSecret, ""),
 	)
 	log.Println("SLS client created successfully")
 
