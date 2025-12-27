@@ -14,5 +14,11 @@
     ]
   },
 
+  "path_exclude": [
+    "/health",
+    "/favicon.",
+    "/."
+  ],
+
   "http_listen": ":8080"
 }

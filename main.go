@@ -23,6 +23,7 @@ type Config struct {
 	Project      string              `json:"project"`
 	Logstore     string              `json:"logstore"`
 	PathPrefix   map[string][]string `json:"path_prefix"`
+	PathExclude  []string            `json:"path_exclude"`
 	HTTPListen   string              `json:"http_listen"`
 }
 
@@ -36,7 +37,6 @@ type HostStat struct {
 	RequestTime   float64
 	Paths         map[string]*PathStat // 完整 URI 路径统计
 	PathsLRU      []string             // 最近更新的完整路径列表，最多保留30个
-	Prefixes      map[string]*PathStat // path_prefix 前缀统计（独立维度）
 	mu            sync.RWMutex
 }
 
@@ -75,13 +75,7 @@ type StatResult struct {
 	AvgRequestTime float64             `json:"avg_request_time"`
 	AvgRequestSize float64             `json:"avg_request_size"`
 	SuccessRate    float64             `json:"success_rate"`
-	Paths          map[string]PathStat `json:"paths,omitempty"`    // 完整路径统计
-	Prefixes       map[string]PathStat `json:"prefixes,omitempty"` // 前缀统计
-}
-
-type PathListItem struct {
-	Path    string `json:"path"`
-	Request int64  `json:"request"`
+	Paths          map[string]PathStat `json:"paths,omitempty"` // 完整路径统计
 }
 
 type UpstreamStatResult struct {
@@ -353,6 +347,21 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 			if idx := strings.Index(uri, "?"); idx != -1 {
 				trimPath = uri[:idx]
 			}
+
+			// 检查是否在排除列表中，如果是则跳过统计
+			shouldExclude := false
+			for _, excludePath := range cfg.PathExclude {
+				if strings.HasPrefix(trimPath, excludePath) {
+					log.Printf("Excluding path from stats: %s", trimPath)
+					shouldExclude = true
+					break
+				}
+			}
+			if shouldExclude {
+				skipped++
+				continue
+			}
+
 			// 获取 upstream 相关字段
 			upstreamAddr := fields["upstream_addr"]
 			upstreamStatus, _ := strconv.Atoi(fields["upstream_status"])
@@ -389,7 +398,7 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 				h.Request5XX++
 			}
 
-			// 1. 统计完整 URI 路径（所有请求都统计）
+			// 统计完整 URI 路径
 			uriPath := getOrCreatePath(h, trimPath)
 			uriPath.Request++
 			uriPath.RequestLength += reqLen
@@ -403,34 +412,6 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 				uriPath.Request4XX++
 			case status >= 500 && status < 600:
 				uriPath.Request5XX++
-			}
-
-			// 2. 如果配置了 path_prefix，独立统计匹配的前缀
-			if prefixes, ok := cfg.PathPrefix[host]; ok && len(prefixes) > 0 {
-				for _, prefix := range prefixes {
-					if strings.HasPrefix(trimPath, prefix) {
-						prefixStat := getOrCreatePrefix(h, prefix)
-						prefixStat.Request++
-						prefixStat.RequestLength += reqLen
-						prefixStat.RequestTime += reqTime
-						prefixStat.LastUpdated = time.Now()
-
-						switch {
-						case status >= 200 && status < 300:
-							prefixStat.Request20X++
-						case status >= 400 && status < 500:
-							prefixStat.Request4XX++
-						case status >= 500 && status < 600:
-							prefixStat.Request5XX++
-						}
-
-						// 第一次匹配时打印调试信息
-						if processed < 5 {
-							log.Printf("  [%s] URI '%s' matched prefix: %s", host, uri, prefix)
-						}
-						break // 只匹配第一个前缀
-					}
-				}
 			}
 
 			h.mu.Unlock()
@@ -490,7 +471,6 @@ func getOrCreateHost(host string) *HostStat {
 		Host:     host,
 		Paths:    make(map[string]*PathStat),
 		PathsLRU: make([]string, 0, 30),
-		Prefixes: make(map[string]*PathStat),
 	}
 	hostStats[host] = h
 	log.Printf("New host tracked: %s", host)
@@ -499,8 +479,10 @@ func getOrCreateHost(host string) *HostStat {
 
 func getOrCreatePath(h *HostStat, prefix string) *PathStat {
 	if ps, ok := h.Paths[prefix]; ok {
-		// 更新 LRU 列表
-		updatePathLRU(h, prefix)
+		// 更新 LRU 列表（白名单路径不参与 LRU）
+		if !isPathInWhitelist(h.Host, prefix) {
+			updatePathLRU(h, prefix)
+		}
 		return ps
 	}
 	ps := &PathStat{
@@ -509,29 +491,37 @@ func getOrCreatePath(h *HostStat, prefix string) *PathStat {
 	}
 	h.Paths[prefix] = ps
 
-	// 添加到 LRU 列表头部
-	updatePathLRU(h, prefix)
+	// 只有非白名单路径才添加到 LRU 列表
+	if !isPathInWhitelist(h.Host, prefix) {
+		// 添加到 LRU 列表头部
+		updatePathLRU(h, prefix)
 
-	// 如果超过30个，删除最旧的
-	if len(h.PathsLRU) > 30 {
-		oldestPath := h.PathsLRU[len(h.PathsLRU)-1]
-		delete(h.Paths, oldestPath)
-		h.PathsLRU = h.PathsLRU[:30]
+		// 如果超过30个，删除最旧的（只从非白名单路径中删除）
+		if len(h.PathsLRU) > 30 {
+			for i := len(h.PathsLRU) - 1; i >= 0; i-- {
+				oldestPath := h.PathsLRU[i]
+				if !isPathInWhitelist(h.Host, oldestPath) {
+					delete(h.Paths, oldestPath)
+					h.PathsLRU = append(h.PathsLRU[:i], h.PathsLRU[i+1:]...)
+					break
+				}
+			}
+		}
 	}
 
 	return ps
 }
 
-func getOrCreatePrefix(h *HostStat, prefix string) *PathStat {
-	if ps, ok := h.Prefixes[prefix]; ok {
-		return ps
+// isPathInWhitelist 检查路径是否在白名单中（path_prefix配置）
+func isPathInWhitelist(host string, path string) bool {
+	if prefixes, ok := cfg.PathPrefix[host]; ok {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(path, prefix) {
+				return true
+			}
+		}
 	}
-	ps := &PathStat{
-		Path:        prefix,
-		LastUpdated: time.Now(),
-	}
-	h.Prefixes[prefix] = ps
-	return ps
+	return false
 }
 
 // updatePathLRU 更新路径的 LRU 位置（移到最前面）
@@ -574,7 +564,7 @@ func getOrCreateUpstream(upstream string, host string) *UpstreamStat {
 	return us
 }
 
-func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat, prefixes map[string]*PathStat) StatResult {
+func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat, _ map[string]*PathStat) StatResult {
 	result := StatResult{
 		Host:          host,
 		Request:       request,
@@ -589,20 +579,6 @@ func calculateStatResult(host string, request, request20X, request4XX, request5X
 		result.AvgRequestTime = requestTime / float64(request)
 		result.AvgRequestSize = float64(requestLength) / float64(request)
 		result.SuccessRate = float64(request20X) / float64(request) * 100
-	}
-
-	// if paths != nil {
-	// 	result.Paths = make(map[string]PathStat)
-	// 	for k, v := range paths {
-	// 		result.Paths[k] = *v
-	// 	}
-	// }
-
-	if prefixes != nil {
-		result.Prefixes = make(map[string]PathStat)
-		for k, v := range prefixes {
-			result.Prefixes[k] = *v
-		}
 	}
 
 	return result
@@ -732,7 +708,7 @@ func getHostDetail(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	result := calculateStatResult(
 		h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
-		h.RequestLength, h.RequestTime, h.Paths, h.Prefixes,
+		h.RequestLength, h.RequestTime, h.Paths, nil,
 	)
 	h.mu.RUnlock()
 
@@ -755,34 +731,64 @@ func getHostPath(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.RLock()
-	ps, ok := h.Paths[path]
-	if !ok {
-		h.mu.RUnlock()
+	defer h.mu.RUnlock()
+
+	// 尝试精确匹配
+	if ps, ok := h.Paths[path]; ok {
+		result := StatResult{
+			Host:          host,
+			Path:          ps.Path,
+			Request:       ps.Request,
+			Request20X:    ps.Request20X,
+			Request4XX:    ps.Request4XX,
+			Request5XX:    ps.Request5XX,
+			RequestLength: ps.RequestLength,
+			RequestTime:   ps.RequestTime,
+		}
+
+		if ps.Request > 0 {
+			result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
+			result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
+			result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	// 如果精确匹配失败，尝试前缀匹配并返回匹配的路径列表
+	var matchingPaths []StatResult
+	for pathKey, ps := range h.Paths {
+		if strings.HasPrefix(pathKey, path) {
+			result := StatResult{
+				Host:          host,
+				Path:          ps.Path,
+				Request:       ps.Request,
+				Request20X:    ps.Request20X,
+				Request4XX:    ps.Request4XX,
+				Request5XX:    ps.Request5XX,
+				RequestLength: ps.RequestLength,
+				RequestTime:   ps.RequestTime,
+			}
+
+			if ps.Request > 0 {
+				result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
+				result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
+				result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
+			}
+
+			matchingPaths = append(matchingPaths, result)
+		}
+	}
+
+	if len(matchingPaths) == 0 {
 		http.Error(w, "Path not found", http.StatusNotFound)
 		return
 	}
 
-	result := StatResult{
-		Host:          host,
-		Path:          ps.Path,
-		Request:       ps.Request,
-		Request20X:    ps.Request20X,
-		Request4XX:    ps.Request4XX,
-		Request5XX:    ps.Request5XX,
-		RequestLength: ps.RequestLength,
-		RequestTime:   ps.RequestTime,
-	}
-
-	if ps.Request > 0 {
-		result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
-		result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
-		result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
-	}
-
-	h.mu.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(matchingPaths)
 }
 
 func getHostPaths(w http.ResponseWriter, r *http.Request) {
@@ -799,15 +805,27 @@ func getHostPaths(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.RLock()
-	// 根据 LRU 列表返回路径信息（已经按最近更新排序）
-	results := make([]PathListItem, 0, len(h.PathsLRU))
-	for _, path := range h.PathsLRU {
-		if ps, ok := h.Paths[path]; ok {
-			results = append(results, PathListItem{
-				Path:    ps.Path,
-				Request: ps.Request,
-			})
+	// 返回所有路径信息
+	results := make([]StatResult, 0, len(h.Paths))
+	for _, ps := range h.Paths {
+		result := StatResult{
+			Host:          host,
+			Path:          ps.Path,
+			Request:       ps.Request,
+			Request20X:    ps.Request20X,
+			Request4XX:    ps.Request4XX,
+			Request5XX:    ps.Request5XX,
+			RequestLength: ps.RequestLength,
+			RequestTime:   ps.RequestTime,
 		}
+
+		if ps.Request > 0 {
+			result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
+			result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
+			result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
+		}
+
+		results = append(results, result)
 	}
 	h.mu.RUnlock()
 
