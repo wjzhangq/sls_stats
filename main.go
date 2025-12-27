@@ -51,6 +51,36 @@ type PathStat struct {
 	LastUpdated   time.Time // 最后更新时间
 }
 
+// ToStatResult converts PathStat to StatResult
+func (ps *PathStat) ToStatResult(host string) StatResult {
+	result := StatResult{
+		Host:          host,
+		Path:          ps.Path,
+		Request:       ps.Request,
+		Request20X:    ps.Request20X,
+		Request4XX:    ps.Request4XX,
+		Request5XX:    ps.Request5XX,
+		RequestLength: ps.RequestLength,
+		RequestTime:   ps.RequestTime,
+	}
+
+	if ps.Request > 0 {
+		result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
+		result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
+		result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
+	}
+
+	return result
+}
+
+// ToStatResult converts HostStat to StatResult (without paths)
+func (h *HostStat) ToStatResult() StatResult {
+	return calculateStatResult(
+		h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
+		h.RequestLength, h.RequestTime,
+	)
+}
+
 type UpstreamStat struct {
 	Upstream      string
 	Host          string // 关联的主机
@@ -61,6 +91,28 @@ type UpstreamStat struct {
 	RequestLength int64
 	RequestTime   float64
 	mu            sync.RWMutex
+}
+
+// ToStatResult converts UpstreamStat to UpstreamStatResult
+func (us *UpstreamStat) ToStatResult() UpstreamStatResult {
+	result := UpstreamStatResult{
+		Upstream:      us.Upstream,
+		Host:          us.Host,
+		Request:       us.Request,
+		Request20X:    us.Request20X,
+		Request4XX:    us.Request4XX,
+		Request5XX:    us.Request5XX,
+		RequestLength: us.RequestLength,
+		RequestTime:   us.RequestTime,
+	}
+
+	if us.Request > 0 {
+		result.AvgRequestTime = us.RequestTime / float64(us.Request)
+		result.AvgRequestSize = float64(us.RequestLength) / float64(us.Request)
+		result.SuccessRate = float64(us.Request20X) / float64(us.Request) * 100
+	}
+
+	return result
 }
 
 type StatResult struct {
@@ -93,16 +145,14 @@ type UpstreamStatResult struct {
 }
 
 var (
-	cfg            Config
-	client         sls.ClientInterface
-	hostStats      = make(map[string]*HostStat)
-	upstreamStats  = make(map[string]*UpstreamStat)
-	mu             sync.RWMutex
-	upstreamMu     sync.RWMutex
-	ctx            context.Context
-	cancel         context.CancelFunc
+	cfg           Config
+	client        sls.ClientInterface
+	hostStats     = sync.Map{}
+	upstreamStats = sync.Map{}
+	ctx           context.Context
+	cancel        context.CancelFunc
 	totalProcessed int64
-	startTime      time.Time
+	startTime     time.Time
 )
 
 func main() {
@@ -313,16 +363,32 @@ func pullShard(shardID int) {
 	}
 }
 
+// LogEntry represents a parsed log entry for batch processing
+type LogEntry struct {
+	host            string
+	status          int
+	reqLen          int64
+	reqTime         float64
+	trimPath        string
+	upstreamAddr    string
+	upstreamStatus  int
+	upstreamRespTime float64
+	shouldSkip      bool
+}
+
 func processLogGroups(lgList *sls.LogGroupList) int {
 	if lgList == nil {
 		return 0
 	}
 
-	processed := 0
-	skipped := 0
+	// 批量解析日志
+	var entries []LogEntry
+	var skipped int
 
 	for _, lg := range lgList.LogGroups {
 		for _, l := range lg.Logs {
+			entry := LogEntry{}
+
 			// 解析日志字段
 			fields := make(map[string]string)
 			for _, c := range l.Contents {
@@ -331,114 +397,145 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 				}
 			}
 
-			host := fields["host"]
-			if host == "" {
+			entry.host = fields["host"]
+			if entry.host == "" {
 				skipped++
 				continue
 			}
 
-			status, _ := strconv.Atoi(fields["status"])
-			reqLen, _ := strconv.ParseInt(fields["request_length"], 10, 64)
-			reqTime, _ := strconv.ParseFloat(fields["request_time"], 64)
-			uri := fields["request_uri"]
-
-			// 去除 query 参数，只保留路径
-			trimPath := uri
-			if idx := strings.Index(uri, "?"); idx != -1 {
-				trimPath = uri[:idx]
+			// 解析数值字段并记录错误
+			if status, err := strconv.Atoi(fields["status"]); err == nil {
+				entry.status = status
 			}
 
-			// 检查是否在排除列表中，如果是则跳过统计
-			shouldExclude := false
+			if reqLen, err := strconv.ParseInt(fields["request_length"], 10, 64); err == nil {
+				entry.reqLen = reqLen
+			}
+
+			if reqTime, err := strconv.ParseFloat(fields["request_time"], 64); err == nil {
+				entry.reqTime = reqTime
+			}
+
+			uri := fields["request_uri"]
+			// 去除 query 参数，只保留路径
+			if idx := strings.Index(uri, "?"); idx != -1 {
+				entry.trimPath = uri[:idx]
+			} else {
+				entry.trimPath = uri
+			}
+
+			// 检查是否在排除列表中
 			for _, excludePath := range cfg.PathExclude {
-				if strings.HasPrefix(trimPath, excludePath) {
-					log.Printf("Excluding path from stats: %s", trimPath)
-					shouldExclude = true
+				if strings.HasPrefix(entry.trimPath, excludePath) {
+					entry.shouldSkip = true
 					break
 				}
 			}
-			if shouldExclude {
+			if entry.shouldSkip {
 				skipped++
 				continue
 			}
 
 			// 获取 upstream 相关字段
-			upstreamAddr := fields["upstream_addr"]
-			upstreamStatus, _ := strconv.Atoi(fields["upstream_status"])
-			upstreamRespTime, _ := strconv.ParseFloat(fields["upstream_response_time"], 64)
-
-			// 第一次处理日志时打印样例
-			if atomic.LoadInt64(&totalProcessed) == 0 && processed == 0 {
-				log.Println("Sample log entry:")
-				log.Printf("  host: %s", host)
-				log.Printf("  status: %d", status)
-				log.Printf("  request_uri: %s", uri)
-				log.Printf("  request_length: %d", reqLen)
-				log.Printf("  request_time: %.3f", reqTime)
-				log.Printf("  upstream_addr: %s", upstreamAddr)
-				log.Printf("  upstream_status: %d", upstreamStatus)
-				log.Printf("  upstream_response_time: %.3f", upstreamRespTime)
+			entry.upstreamAddr = fields["upstream_addr"]
+			if upstreamStatus, err := strconv.Atoi(fields["upstream_status"]); err == nil {
+				entry.upstreamStatus = upstreamStatus
+			}
+			if upstreamRespTime, err := strconv.ParseFloat(fields["upstream_response_time"], 64); err == nil {
+				entry.upstreamRespTime = upstreamRespTime
 			}
 
-			// 更新主机统计
-			h := getOrCreateHost(host)
-			h.mu.Lock()
+			entries = append(entries, entry)
+		}
+	}
 
-			h.Request++
-			h.RequestLength += reqLen
-			h.RequestTime += reqTime
+	if len(entries) == 0 {
+		return 0
+	}
 
-			// 按状态码分类
+	// 第一次处理日志时打印样例
+	if atomic.LoadInt64(&totalProcessed) == 0 {
+		log.Println("Sample log entry:")
+		log.Printf("  host: %s", entries[0].host)
+		log.Printf("  status: %d", entries[0].status)
+		log.Printf("  request_uri: %s", entries[0].trimPath)
+		log.Printf("  request_length: %d", entries[0].reqLen)
+		log.Printf("  request_time: %.3f", entries[0].reqTime)
+		log.Printf("  upstream_addr: %s", entries[0].upstreamAddr)
+		log.Printf("  upstream_status: %d", entries[0].upstreamStatus)
+		log.Printf("  upstream_response_time: %.3f", entries[0].upstreamRespTime)
+	}
+
+	// 批量更新统计（按 host 分组减少锁竞争）
+	hostMap := make(map[string]*HostStat)
+	upstreamMap := make(map[string]*UpstreamStat)
+
+	for _, entry := range entries {
+		// 获取或创建 HostStat
+		h, ok := hostMap[entry.host]
+		if !ok {
+			h = getOrCreateHost(entry.host)
+			hostMap[entry.host] = h
+		}
+
+		h.mu.Lock()
+
+		h.Request++
+		h.RequestLength += entry.reqLen
+		h.RequestTime += entry.reqTime
+
+		switch {
+		case entry.status >= 200 && entry.status < 300:
+			h.Request20X++
+		case entry.status >= 400 && entry.status < 500:
+			h.Request4XX++
+		case entry.status >= 500 && entry.status < 600:
+			h.Request5XX++
+		}
+
+		// 统计完整 URI 路径
+		uriPath := getOrCreatePath(h, entry.trimPath)
+		uriPath.Request++
+		uriPath.RequestLength += entry.reqLen
+		uriPath.RequestTime += entry.reqTime
+		uriPath.LastUpdated = time.Now()
+
+		switch {
+		case entry.status >= 200 && entry.status < 300:
+			uriPath.Request20X++
+		case entry.status >= 400 && entry.status < 500:
+			uriPath.Request4XX++
+		case entry.status >= 500 && entry.status < 600:
+			uriPath.Request5XX++
+		}
+
+		h.mu.Unlock()
+
+		// 更新 upstream 统计
+		if entry.upstreamAddr != "" {
+			upstreamKey := entry.upstreamAddr + "@" + entry.host
+			us, ok := upstreamMap[upstreamKey]
+			if !ok {
+				us = getOrCreateUpstream(entry.upstreamAddr, entry.host)
+				upstreamMap[upstreamKey] = us
+			}
+
+			us.mu.Lock()
+
+			us.Request++
+			us.RequestLength += entry.reqLen
+			us.RequestTime += entry.upstreamRespTime
+
 			switch {
-			case status >= 200 && status < 300:
-				h.Request20X++
-			case status >= 400 && status < 500:
-				h.Request4XX++
-			case status >= 500 && status < 600:
-				h.Request5XX++
+			case entry.upstreamStatus >= 200 && entry.upstreamStatus < 300:
+				us.Request20X++
+			case entry.upstreamStatus >= 400 && entry.upstreamStatus < 500:
+				us.Request4XX++
+			case entry.upstreamStatus >= 500 && entry.upstreamStatus < 600:
+				us.Request5XX++
 			}
 
-			// 统计完整 URI 路径
-			uriPath := getOrCreatePath(h, trimPath)
-			uriPath.Request++
-			uriPath.RequestLength += reqLen
-			uriPath.RequestTime += reqTime
-			uriPath.LastUpdated = time.Now()
-
-			switch {
-			case status >= 200 && status < 300:
-				uriPath.Request20X++
-			case status >= 400 && status < 500:
-				uriPath.Request4XX++
-			case status >= 500 && status < 600:
-				uriPath.Request5XX++
-			}
-
-			h.mu.Unlock()
-
-			// 更新 upstream 统计
-			if upstreamAddr != "" {
-				us := getOrCreateUpstream(upstreamAddr, host)
-				us.mu.Lock()
-
-				us.Request++
-				us.RequestLength += reqLen
-				us.RequestTime += upstreamRespTime // 使用 upstream_response_time
-
-				// 使用 upstream_status 进行分类
-				switch {
-				case upstreamStatus >= 200 && upstreamStatus < 300:
-					us.Request20X++
-				case upstreamStatus >= 400 && upstreamStatus < 500:
-					us.Request4XX++
-				case upstreamStatus >= 500 && upstreamStatus < 600:
-					us.Request5XX++
-				}
-
-				us.mu.Unlock()
-			}
-
-			processed++
+			us.mu.Unlock()
 		}
 	}
 
@@ -446,33 +543,27 @@ func processLogGroups(lgList *sls.LogGroupList) int {
 		log.Printf("Skipped %d logs without host field", skipped)
 	}
 
+	processed := len(entries)
 	atomic.AddInt64(&totalProcessed, int64(processed))
 	return processed
 }
 
 func getOrCreateHost(host string) *HostStat {
-	mu.RLock()
-	h, ok := hostStats[host]
-	mu.RUnlock()
-
-	if ok {
-		return h
+	if h, ok := hostStats.Load(host); ok {
+		return h.(*HostStat)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	// 双重检查
-	if h, ok := hostStats[host]; ok {
-		return h
-	}
-
-	h = &HostStat{
+	h := &HostStat{
 		Host:     host,
 		Paths:    make(map[string]*PathStat),
 		PathsLRU: make([]string, 0, 30),
 	}
-	hostStats[host] = h
+
+	actual, loaded := hostStats.LoadOrStore(host, h)
+	if loaded {
+		return actual.(*HostStat)
+	}
+
 	log.Printf("New host tracked: %s", host)
 	return h
 }
@@ -539,32 +630,25 @@ func updatePathLRU(h *HostStat, path string) {
 }
 
 func getOrCreateUpstream(upstream string, host string) *UpstreamStat {
-	upstreamMu.RLock()
-	us, ok := upstreamStats[upstream]
-	upstreamMu.RUnlock()
-
-	if ok {
-		return us
+	if us, ok := upstreamStats.Load(upstream); ok {
+		return us.(*UpstreamStat)
 	}
 
-	upstreamMu.Lock()
-	defer upstreamMu.Unlock()
-
-	// 双重检查
-	if us, ok := upstreamStats[upstream]; ok {
-		return us
-	}
-
-	us = &UpstreamStat{
+	us := &UpstreamStat{
 		Upstream: upstream,
 		Host:     host,
 	}
-	upstreamStats[upstream] = us
+
+	actual, loaded := upstreamStats.LoadOrStore(upstream, us)
+	if loaded {
+		return actual.(*UpstreamStat)
+	}
+
 	log.Printf("New upstream tracked: %s (host: %s)", upstream, host)
 	return us
 }
 
-func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64, paths map[string]*PathStat, _ map[string]*PathStat) StatResult {
+func calculateStatResult(host string, request, request20X, request4XX, request5XX, requestLength int64, requestTime float64) StatResult {
 	result := StatResult{
 		Host:          host,
 		Request:       request,
@@ -579,27 +663,6 @@ func calculateStatResult(host string, request, request20X, request4XX, request5X
 		result.AvgRequestTime = requestTime / float64(request)
 		result.AvgRequestSize = float64(requestLength) / float64(request)
 		result.SuccessRate = float64(request20X) / float64(request) * 100
-	}
-
-	return result
-}
-
-func calculateUpstreamStatResult(us *UpstreamStat) UpstreamStatResult {
-	result := UpstreamStatResult{
-		Upstream:      us.Upstream,
-		Host:          us.Host,
-		Request:       us.Request,
-		Request20X:    us.Request20X,
-		Request4XX:    us.Request4XX,
-		Request5XX:    us.Request5XX,
-		RequestLength: us.RequestLength,
-		RequestTime:   us.RequestTime,
-	}
-
-	if us.Request > 0 {
-		result.AvgRequestTime = us.RequestTime / float64(us.Request)
-		result.AvgRequestSize = float64(us.RequestLength) / float64(us.Request)
-		result.SuccessRate = float64(us.Request20X) / float64(us.Request) * 100
 	}
 
 	return result
@@ -651,13 +714,17 @@ func healthCheck(w http.ResponseWriter, _ *http.Request) {
 }
 
 func getGlobalStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	hostCount := len(hostStats)
-	mu.RUnlock()
+	hostCount := 0
+	hostStats.Range(func(_, _ any) bool {
+		hostCount++
+		return true
+	})
 
-	upstreamMu.RLock()
-	upstreamCount := len(upstreamStats)
-	upstreamMu.RUnlock()
+	upstreamCount := 0
+	upstreamStats.Range(func(_, _ any) bool {
+		upstreamCount++
+		return true
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -670,20 +737,16 @@ func getGlobalStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func getHosts(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	hosts := make([]*HostStat, 0, len(hostStats))
-	for _, h := range hostStats {
-		hosts = append(hosts, h)
-	}
-	mu.RUnlock()
+	hosts := make([]*HostStat, 0, 16)
+	hostStats.Range(func(_, value any) bool {
+		hosts = append(hosts, value.(*HostStat))
+		return true
+	})
 
 	results := make([]StatResult, 0, len(hosts))
 	for _, h := range hosts {
 		h.mu.RLock()
-		result := calculateStatResult(
-			h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
-			h.RequestLength, h.RequestTime, nil, nil,
-		)
+		result := h.ToStatResult()
 		h.mu.RUnlock()
 		results = append(results, result)
 	}
@@ -696,20 +759,15 @@ func getHostDetail(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
 	host := v["host"]
 
-	mu.RLock()
-	h, ok := hostStats[host]
-	mu.RUnlock()
-
+	value, ok := hostStats.Load(host)
 	if !ok {
 		http.Error(w, "Host not found", http.StatusNotFound)
 		return
 	}
 
+	h := value.(*HostStat)
 	h.mu.RLock()
-	result := calculateStatResult(
-		h.Host, h.Request, h.Request20X, h.Request4XX, h.Request5XX,
-		h.RequestLength, h.RequestTime, h.Paths, nil,
-	)
+	result := h.ToStatResult()
 	h.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -721,64 +779,28 @@ func getHostPath(w http.ResponseWriter, r *http.Request) {
 	host := v["host"]
 	path := "/" + v["path"]
 
-	mu.RLock()
-	h, ok := hostStats[host]
-	mu.RUnlock()
-
+	value, ok := hostStats.Load(host)
 	if !ok {
 		http.Error(w, "Host not found", http.StatusNotFound)
 		return
 	}
 
+	h := value.(*HostStat)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	// 尝试精确匹配
 	if ps, ok := h.Paths[path]; ok {
-		result := StatResult{
-			Host:          host,
-			Path:          ps.Path,
-			Request:       ps.Request,
-			Request20X:    ps.Request20X,
-			Request4XX:    ps.Request4XX,
-			Request5XX:    ps.Request5XX,
-			RequestLength: ps.RequestLength,
-			RequestTime:   ps.RequestTime,
-		}
-
-		if ps.Request > 0 {
-			result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
-			result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
-			result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
-		}
-
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
+		json.NewEncoder(w).Encode(ps.ToStatResult(host))
 		return
 	}
 
 	// 如果精确匹配失败，尝试前缀匹配并返回匹配的路径列表
 	var matchingPaths []StatResult
-	for pathKey, ps := range h.Paths {
-		if strings.HasPrefix(pathKey, path) {
-			result := StatResult{
-				Host:          host,
-				Path:          ps.Path,
-				Request:       ps.Request,
-				Request20X:    ps.Request20X,
-				Request4XX:    ps.Request4XX,
-				Request5XX:    ps.Request5XX,
-				RequestLength: ps.RequestLength,
-				RequestTime:   ps.RequestTime,
-			}
-
-			if ps.Request > 0 {
-				result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
-				result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
-				result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
-			}
-
-			matchingPaths = append(matchingPaths, result)
+	for _, ps := range h.Paths {
+		if strings.HasPrefix(ps.Path, path) {
+			matchingPaths = append(matchingPaths, ps.ToStatResult(host))
 		}
 	}
 
@@ -795,37 +817,18 @@ func getHostPaths(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
 	host := v["host"]
 
-	mu.RLock()
-	h, ok := hostStats[host]
-	mu.RUnlock()
-
+	value, ok := hostStats.Load(host)
 	if !ok {
 		http.Error(w, "Host not found", http.StatusNotFound)
 		return
 	}
 
+	h := value.(*HostStat)
 	h.mu.RLock()
 	// 返回所有路径信息
 	results := make([]StatResult, 0, len(h.Paths))
 	for _, ps := range h.Paths {
-		result := StatResult{
-			Host:          host,
-			Path:          ps.Path,
-			Request:       ps.Request,
-			Request20X:    ps.Request20X,
-			Request4XX:    ps.Request4XX,
-			Request5XX:    ps.Request5XX,
-			RequestLength: ps.RequestLength,
-			RequestTime:   ps.RequestTime,
-		}
-
-		if ps.Request > 0 {
-			result.AvgRequestTime = ps.RequestTime / float64(ps.Request)
-			result.AvgRequestSize = float64(ps.RequestLength) / float64(ps.Request)
-			result.SuccessRate = float64(ps.Request20X) / float64(ps.Request) * 100
-		}
-
-		results = append(results, result)
+		results = append(results, ps.ToStatResult(host))
 	}
 	h.mu.RUnlock()
 
@@ -834,17 +837,16 @@ func getHostPaths(w http.ResponseWriter, r *http.Request) {
 }
 
 func getUpstreams(w http.ResponseWriter, _ *http.Request) {
-	upstreamMu.RLock()
-	upstreams := make([]*UpstreamStat, 0, len(upstreamStats))
-	for _, us := range upstreamStats {
-		upstreams = append(upstreams, us)
-	}
-	upstreamMu.RUnlock()
+	upstreams := make([]*UpstreamStat, 0, 16)
+	upstreamStats.Range(func(_, value any) bool {
+		upstreams = append(upstreams, value.(*UpstreamStat))
+		return true
+	})
 
 	results := make([]UpstreamStatResult, 0, len(upstreams))
 	for _, us := range upstreams {
 		us.mu.RLock()
-		result := calculateUpstreamStatResult(us)
+		result := us.ToStatResult()
 		us.mu.RUnlock()
 		results = append(results, result)
 	}
@@ -857,17 +859,15 @@ func getUpstreamDetail(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
 	upstream := v["upstream"]
 
-	upstreamMu.RLock()
-	us, ok := upstreamStats[upstream]
-	upstreamMu.RUnlock()
-
+	value, ok := upstreamStats.Load(upstream)
 	if !ok {
 		http.Error(w, "Upstream not found", http.StatusNotFound)
 		return
 	}
 
+	us := value.(*UpstreamStat)
 	us.mu.RLock()
-	result := calculateUpstreamStatResult(us)
+	result := us.ToStatResult()
 	us.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
