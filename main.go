@@ -24,6 +24,7 @@ type Config struct {
 	Logstore     string              `json:"logstore"`
 	PathPrefix   map[string][]string `json:"path_prefix"`
 	PathExclude  []string            `json:"path_exclude"`
+	APIKey       string              `json:"api_key"`
 	HTTPListen   string              `json:"http_listen"`
 }
 
@@ -145,14 +146,14 @@ type UpstreamStatResult struct {
 }
 
 var (
-	cfg           Config
-	client        sls.ClientInterface
-	hostStats     = sync.Map{}
-	upstreamStats = sync.Map{}
-	ctx           context.Context
-	cancel        context.CancelFunc
+	cfg            Config
+	client         sls.ClientInterface
+	hostStats      = sync.Map{}
+	upstreamStats  = sync.Map{}
+	ctx            context.Context
+	cancel         context.CancelFunc
 	totalProcessed int64
-	startTime     time.Time
+	startTime      time.Time
 )
 
 func main() {
@@ -365,15 +366,15 @@ func pullShard(shardID int) {
 
 // LogEntry represents a parsed log entry for batch processing
 type LogEntry struct {
-	host            string
-	status          int
-	reqLen          int64
-	reqTime         float64
-	trimPath        string
-	upstreamAddr    string
-	upstreamStatus  int
+	host             string
+	status           int
+	reqLen           int64
+	reqTime          float64
+	trimPath         string
+	upstreamAddr     string
+	upstreamStatus   int
 	upstreamRespTime float64
-	shouldSkip      bool
+	shouldSkip       bool
 }
 
 func processLogGroups(lgList *sls.LogGroupList) int {
@@ -668,16 +669,49 @@ func calculateStatResult(host string, request, request20X, request4XX, request5X
 	return result
 }
 
+// apiKeyAuthMiddleware 验证 Authorization header 中的 Bearer token
+func apiKeyAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 如果 APIKey 为空，跳过验证
+		if cfg.APIKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		// 验证 Bearer token 格式
+		expected := "Bearer " + cfg.APIKey
+		if authHeader != expected {
+			http.Error(w, "Invalid API key", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func startHTTP() {
 	r := mux.NewRouter()
-	r.HandleFunc("/hosts", getHosts).Methods("GET")
-	r.HandleFunc("/hosts/{host}", getHostDetail).Methods("GET")
-	r.HandleFunc("/hosts/{host}/paths", getHostPaths).Methods("GET")
-	r.HandleFunc("/hosts/{host}/paths/{path:.*}", getHostPath).Methods("GET")
-	r.HandleFunc("/upstreams", getUpstreams).Methods("GET")
-	r.HandleFunc("/upstreams/{upstream}", getUpstreamDetail).Methods("GET")
-	r.HandleFunc("/stats", getGlobalStats).Methods("GET")
+
+	// 健康检查不需要认证
 	r.HandleFunc("/health", healthCheck).Methods("GET")
+
+	// 需要认证的路由
+	authRequired := r.PathPrefix("/").Subrouter()
+	authRequired.Use(apiKeyAuthMiddleware)
+
+	authRequired.HandleFunc("/hosts", getHosts).Methods("GET")
+	authRequired.HandleFunc("/hosts/{host}", getHostDetail).Methods("GET")
+	authRequired.HandleFunc("/hosts/{host}/paths", getHostPaths).Methods("GET")
+	authRequired.HandleFunc("/hosts/{host}/paths/{path:.*}", getHostPath).Methods("GET")
+	authRequired.HandleFunc("/upstreams", getUpstreams).Methods("GET")
+	authRequired.HandleFunc("/upstreams/{upstream}", getUpstreamDetail).Methods("GET")
+	authRequired.HandleFunc("/stats", getGlobalStats).Methods("GET")
 
 	// 优雅关闭
 	srv := &http.Server{
